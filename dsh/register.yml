@@ -1,0 +1,54 @@
+# dsh 注册配置片段（Ebook-Translator MCP Server）
+# ================================================================
+# 用法：把下面 - insert: 整段合并进对应 profile 的 patch 文件：
+#   交互式 Web 界面:  ~/.dsh/profiles/web/cordis.patch.yml
+#   无人值守模式:    ~/.dsh/profiles/headless/cordis.patch.yml
+# 注意：
+#   * 若文件里已有 - insert: 块，把本段的 - id: ... 条目并进去即可；
+#   * 新插件必须挂在 insert: 下，写成裸的 - id: 行会导致启动失败；
+#   * 需要先从源码构建官方 dsh-mcp-client（pnpm build 后用 pnpm dsh
+#     启动），或改用 npm 社区等价插件（见文件末尾备选方案）。
+#   * Windows 路径在 YAML 中要用单引号包裹，如 'C:\tools\etmcp\...'。
+
+- insert:
+  - id: mcp-ebook-translator
+    name: '@deepseek-ai/dsh-mcp-client'
+    config:
+      serverName: ebook-translator
+      transport: stdio
+      # 关键：写入撞上 Calibre 写锁时，服务器会静默等待（最长约 23s），
+      # 期间客户端收不到任何字节。toolCallTimeoutMs 必须大于该上限
+      # （默认 60000 一般够；若仍报 -32001 请显式加大，如 120000）。
+      toolCallTimeoutMs: 120000
+      # 方式一：已 pip install mcp（推荐，兼容 mcp 1.x 与 2.x）
+      command: python
+      args:
+        - /absolute/path/to/ebook_translator_mcp.py
+      # 方式二：免安装依赖（装了 uv 的话），注释掉上面两行改用：
+      # command: uv
+      # args:
+      #   - run
+      #   - '--with'
+      #   - mcp
+      #   - python
+      #   - /absolute/path/to/ebook_translator_mcp.py
+      # 可选：显式指定缓存根目录（默认自动探测 Calibre 配置与平台默认路径）
+      # env:
+      #   EBOOK_TRANSLATOR_CACHE_DIR: 'C:\Users\you\AppData\Local\calibre-cache\plugins\ebook-translator'
+      #   EBOOK_TRANSLATOR_ENGINE_NAME: 'MCP'
+      cwd: !!js process.cwd()
+
+# ----------------------------------------------------------------
+# 远程部署备选（dsh 与 Calibre 不在同一台机器时）：
+#   先在 Calibre 那台机器上启动 HTTP 模式：
+#     python ebook_translator_mcp.py --transport http --port 8420
+#   然后把上面 config 整段替换为：
+#     config:
+#       serverName: ebook-translator
+#       transport: streamable-http
+#       url: http://<calibre机器IP>:8420/mcp
+# ----------------------------------------------------------------
+# 社区客户端备选（未从源码构建官方插件时，配置结构相同）：
+#   name: 'dsh-mcp-manager'        # 带 Settings -> MCP 图形界面
+#   name: '@crazx/dsh-mcp-client'  # npm 直装
+# ----------------------------------------------------------------
