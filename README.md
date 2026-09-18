@@ -7,4 +7,4 @@
 
 pip install mcp
 
-python 你的路径-ebook_translator_mcp.py -selftest
+python 你的路径-ebook_translator_mcp.py --selftest
