@@ -28,7 +28,7 @@ Ebook Translator 插件把每本书的翻译进度存放在 SQLite 缓存里。�
 - Python 3.10+(建议从 [python.org](https://www.python.org/downloads/) 安装;Windows 上避开 Microsoft Store 版,见[故障排查](#故障排查))
 - 任意支持 stdio 服务器的 MCP 客户端
 
-## 安装
+## 安装和自检
 
 **方式 A——用 [uv](https://docs.astral.sh/uv/) 直接运行(免安装、免克隆):**
 

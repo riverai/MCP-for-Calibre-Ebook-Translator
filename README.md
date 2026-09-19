@@ -28,7 +28,7 @@ Key properties:
 - Python 3.10+ (from [python.org](https://www.python.org/downloads/) — on Windows, avoid the Microsoft Store stub, see [Troubleshooting](#troubleshooting))
 - Any MCP client that supports stdio servers
 
-## Install
+## Install and selftest
 
 **Option A — run directly with [uv](https://docs.astral.sh/uv/) (no install, no clone):**
 
