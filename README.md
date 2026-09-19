@@ -10,7 +10,9 @@ An [MCP](https://modelcontextprotocol.io) server that lets any AI agent (Claude 
 
 The plugin keeps doing what it is good at (parsing ebooks, splitting text into numbered chunks, merging output). The agent does the translation in your chat window, using any model you like. The book never leaves your machine: everything happens through local SQLite cache files.
 
-![The plugin's advanced mode: each numbered row is one chunk the MCP tools can read and write](https://github.com/user-attachments/assets/8577f6b4-fab9-4210-9eb7-5622afab97be)
+![插件自检](https://github.com/user-attachments/assets/8577f6b4-fab9-4210-9eb7-5622afab97be)
+<img width="1954" height="1617" alt="image" src="https://github.com/user-attachments/assets/5c9cda99-e8ca-46e1-92ff-03b5a52171a1" />
+
 
 ## How it works
 
