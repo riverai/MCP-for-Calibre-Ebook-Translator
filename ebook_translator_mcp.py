@@ -1,109 +1,144 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Ebook-Translator MCP Server（chunk 版）
-==========================================
+"""Ebook-Translator MCP Server (chunk edition)
+=============================================
 
-让任意 MCP 客户端（dsh / Claude Code / Cursor 等）直接读写 Calibre
-「Ebook Translator」插件（bookfere/Ebook-Translator-Calibre-Plugin，
-v2.4.2 验证）的翻译缓存，把"分段提取"留给插件、把"翻译本身"交给
-对话窗口里的 agent，替代手工复制粘贴。
+Lets any MCP client (dsh / Claude Code / Cursor / ...) read and write the
+translation cache of the Calibre "Ebook Translator" plugin
+(bookfere/Ebook-Translator-Calibre-Plugin, verified against v2.4.2)
+directly: segmentation stays with the plugin, while the translation
+itself is done by an agent in the chat window — replacing manual
+copy-paste.
 
-核心概念（与插件高级模式界面一一对应）
-------------------------------------
-* 一个 **chunk** = 界面左列表格里的一个编号行 = 缓存表 cache 里的一行
-  （合并翻译开启时由 merge_length 上限聚合而成，实测每块约 6000 字符）。
-* **chunk_id 即数据库缓存行的 cache.id**——与插件自身寻址方式一致
-  （lib/cache.py 的 get/update/delete 均按 id 操作），创建后永不变更。
-  在界面里删行只是把该行标记 ignored，其余 chunk 的 id 不受任何
-  影响：agent 已拿到的编号永不失效；任何 chunk 出问题（如不对齐）
-  只需 delete_translations + write_chunk 重做**这一个** chunk，
-  绝不牵连、不重排其他 chunk。对数据库的最小操作单位就是 chunk。
-* 界面左列编号是显示位置（未删行时与 chunk_id 一致；删行后会前移）。
-  工具返回中的 ui_row 即该显示位置，仅供人工对照界面定位行，
-  不可用于寻址。
-* 界面"校对"面板显示的 original / translation 就是本工具
-  get_original / get_translation 返回的原文 / 译文全文——agent 拿到
-  的与人类看到的内容相同，便于运行中人工核对干预。
-* **对齐**：开启合并翻译时（info.merge_length > 0），译文与原文按
-  空行 "\\n\\n" 切分后的块数必须一致，否则界面会以**黄色高亮**提示
-  该行（Non-aligned items）。本工具完全复刻该判定，读/写时都报告
-  aligned 状态，可在写回前就知道会不会触发黄色警告。
+Core concepts (mirroring the plugin's advanced-mode UI)
+-------------------------------------------------------
+* One **chunk** = one numbered row in the left-hand table = one row of
+  the cache table (when merged translation is enabled, paragraphs are
+  aggregated up to the merge_length limit; measured ~6000 characters
+  per chunk).
+* **chunk_id is the cache row's cache.id** — the same addressing the
+  plugin itself uses (lib/cache.py get/update/delete all operate by id);
+  it never changes after creation. Deleting a row in the UI only marks
+  that row ignored; the ids of all other chunks are unaffected: ids the
+  agent already holds never go stale. If a chunk goes wrong (e.g. it is
+  misaligned), redo just that one chunk via delete_translations +
+  write_chunk — no other chunk is touched or renumbered. The minimal
+  unit of database operation is the chunk.
+* The left-column number in the UI is a display position (equal to
+  chunk_id while no rows are deleted; shifts up after deletions). The
+  ui_row field in tool results is that display position — for humans to
+  locate the row in the UI; never use it for addressing.
+* The original / translation shown in the UI "Proofreading" panel is
+  exactly what get_original / get_translation return in full — the agent
+  sees the same text a human sees, so people can review and intervene
+  while the agent runs.
+* **Alignment**: when merged translation is on (info.merge_length > 0),
+  translation and original must split into the same number of blocks by
+  the blank-line separator "\\n\\n", otherwise the UI highlights the row
+  in **yellow** (Non-aligned items). This server replicates that exact
+  check and reports the aligned state on every read/write, so you know
+  before writing back whether the yellow warning would appear.
 
-缓存文件
---------
-    <缓存根目录>/cache/<uid>.db   持久缓存（插件设置启用缓存后生成）
-    <缓存根目录>/temp/<uid>.db    临时缓存（未启用缓存时高级模式窗口
-                                  打开期间存在，关闭即销毁）
+Cache files
+-----------
+    <cache root>/cache/<uid>.db   persistent cache (created once the
+                                  plugin setting enables caching)
+    <cache root>/temp/<uid>.db    temporary cache (when caching is not
+                                  enabled: exists while the advanced-mode
+                                  window is open, destroyed on close)
 
     Windows:       %LOCALAPPDATA%\\calibre-cache\\plugins\\ebook-translator
     macOS / Linux: $TMPDIR/com.bookfere.Calibre.EbookTranslator
 
-表结构（与插件 lib/cache.py 一致，已用真实缓存验证）：
+Schema (identical to the plugin's lib/cache.py, verified on a real cache):
 
     cache(id, md5, raw, original, ignored, attributes, page,
           translation, engine_name, target_lang)
     info(key, value)  -- title / engine_name / target_lang /
                         merge_length / plugin_version ...
 
-重要行为（源自插件源码 + 实测）
-------------------------------
-* 输出电子书（Output）走 cache_only 模式，只读取缓存中已有译文，
-  外部写入的译文会被直接采用；
-* 高级模式界面打开时一次性载入：外部写入不会实时刷新表格，写完
-  须用相同引擎/语言/合并设置重新打开核对；窗口开着时在界面里点
-  Save 会用内存旧数据覆盖该行——agent 批量干活期间建议关窗口；
-* 缓存文件名 uid 由 书籍路径+引擎+目标语言+merge_length+编码 哈希
-  决定，中途改配置会换一个新缓存文件。
+Important behaviors (from plugin source + live testing)
+-------------------------------------------------------
+* Book output (Output) runs in cache_only mode and only reads
+  translations already present in the cache — externally written
+  translations are picked up as-is;
+* The advanced-mode UI loads everything once when opened: external
+  writes do not refresh the table live; after writing, reopen the
+  window with the same engine/language/merge settings to review. While
+  the window is open, clicking Save in the UI overwrites that row with
+  stale in-memory data — close the window while an agent writes in
+  batch;
+* The cache file name (uid) is a hash of book path + engine + target
+  language + merge_length + encoding; changing any setting mid-way
+  switches to a new cache file.
 
-多书寻址（每本书一个独立的 .db 文件）
-------------------------------------
-* list_books 扫描 cache/ 与 temp/ 下全部缓存书：**是的，会展示所有书**，
-  书多时可用 keyword 参数按书名/引擎过滤；
-* book_id（缓存文件名）是唯一可靠的书标识：**同一本书用不同引擎/目标
-  语言/合并设置分段会产生多个缓存文件（书名相同、book_id 不同）**，
-  list_books 对重名书打 duplicate_title 标记，须凭 engine/target_lang/
-  merge_length 区分后再选定；
-* 所有读写工具都必须显式携带 book_id（无隐式"当前书"状态，杜绝串书），
-  且**每个响应都回显 book_id 与书名**——调用方核对回显即可确知操作
-  落在哪本书上，与预期不符立即停止；
-* chunk_id 只在其所属书籍内有效：定位唯一 chunk 需要 (book_id,
-  chunk_id) 二元组，绝不能把 A 书的 chunk_id 用于 B 书。
+Multi-book addressing (one independent .db file per book)
+---------------------------------------------------------
+* list_books scans every cached book under cache/ and temp/: yes, all
+  books are shown; use the keyword argument to filter by title/engine
+  when there are many;
+* book_id (the cache file name) is the only reliable book identity:
+  **segmenting the same book with a different engine / target language /
+  merge setting produces multiple cache files (same title, different
+  book_id)**. list_books marks duplicate-title books; disambiguate by
+  engine/target_lang/merge_length before choosing one;
+* every read/write tool must carry book_id explicitly (there is no
+  implicit "current book" state — books can never be mixed up), and
+  **every response echoes book_id and title** — the caller can verify
+  which book an operation landed on and stop immediately on mismatch;
+* chunk_id is valid only inside its own book: locating a unique chunk
+  requires the (book_id, chunk_id) pair; never use book A's chunk_id on
+  book B.
 
-工具一览
---------
-    list_books             书籍与进度总览（含未对齐 chunk 数，可按关键词过滤）
-    get_book_info          某本书的引擎/语言/合并规则/未对齐编号清单
-    list_chunks            轻量状态表（不带全文，可按状态筛选编号）
-    get_original           读取一个编号（chunk）的完整原文
-    get_translation        读取一个编号（chunk）的完整译文与对齐状态
-    write_chunk            写入一个编号（chunk）的译文，报告对齐状态
-    delete_translations    清空指定编号的译文（重译用）
+Tools
+-----
+    list_books             overview of books & progress (incl. count of
+                           non-aligned chunks; filterable by keyword)
+    get_book_info          engine / languages / merge rule / list of
+                           non-aligned chunk ids for one book
+    list_chunks            lightweight status table (no full texts;
+                           filterable by status)
+    get_original           full original text of one chunk
+    get_translation        full translation + alignment state of one
+                           chunk
+    write_chunk            write the translation of one chunk, reports
+                           alignment
+    delete_translations    clear translations of given chunks (for
+                           rework)
 
-安全边界
---------
-* 只读写已存在的缓存文件：不建书、不建行、不改表结构、不碰 WAL；
-* 写入为短事务（BEGIN IMMEDIATE + busy 重试），与插件界面并存安全；
-* book_id 仅接受缓存目录内已存在的文件名（防路径穿越），SQL 全参数化。
+Safety boundaries
+-----------------
+* Only reads/writes existing cache files: never creates books, rows or
+  tables, never touches WAL;
+* Writes are short transactions (BEGIN IMMEDIATE + busy retry), safe to
+  run alongside the plugin UI;
+* book_id only accepts file names that already exist inside the cache
+  directories (path-traversal proof); SQL is fully parameterized.
 
-环境变量
---------
-EBOOK_TRANSLATOR_CACHE_DIR     显式指定缓存根目录（优先级最高；
-                               其次读取 Calibre 插件配置 cache_path，
-                               最后用平台默认路径）
-EBOOK_TRANSLATOR_ENGINE_NAME   写入译文登记的引擎名，默认 "MCP"
-EBOOK_TRANSLATOR_SEPARATOR     对齐判定分隔符，默认 "\\n\\n"（与插件
-                               内置引擎 separator 一致，一般勿改）
+Environment variables
+---------------------
+EBOOK_TRANSLATOR_CACHE_DIR     Explicit cache root (highest priority;
+                               then the plugin's cache_path from the
+                               Calibre config; then the platform
+                               default)
+EBOOK_TRANSLATOR_ENGINE_NAME   Engine name recorded with written
+                               translations; default "MCP"
+EBOOK_TRANSLATOR_SEPARATOR     Separator used for alignment checks;
+                               default "\\n\\n" (same as the plugin's
+                               built-in engine separator; usually
+                               leave it alone)
 
-运行方式
---------
-    stdio（dsh / Claude Code 等本地客户端）:
+Running
+-------
+    stdio (local clients: dsh / Claude Code / ...):
         python ebook_translator_mcp.py
-    HTTP（远程接入，dsh 的 streamable-http transport）:
+    HTTP (remote access, dsh streamable-http transport):
         python ebook_translator_mcp.py --transport http --port 8420
-    自检（打印探测到的缓存目录与书籍列表）:
+    Self-test (prints the detected cache directory and book list):
         python ebook_translator_mcp.py --selftest
 
-依赖: pip install mcp  （兼容 1.x 与 2.x；或 uv run --with mcp 免安装）
+Dependency: pip install mcp  (works with 1.x and 2.x; or run via
+uv run --with mcp to skip installing)
 """
 
 import json
@@ -118,18 +153,18 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-try:  # mcp 2.x：FastMCP 更名为 MCPServer
+try:  # mcp 2.x: FastMCP was renamed to MCPServer
     from mcp.server.mcpserver import MCPServer as _MCPServerBase
     from mcp.server.mcpserver.exceptions import ToolError as _ToolError
 except ImportError:  # mcp 1.x
     from mcp.server.fastmcp import FastMCP as _MCPServerBase
     try:
         from mcp.server.fastmcp.exceptions import ToolError as _ToolError
-    except ImportError:  # 极旧版本兜底
+    except ImportError:  # fallback for very old versions
         class _ToolError(Exception):
             pass
 
-# stdio 模式下 stdout 属于协议信道，日志只能走 stderr
+# In stdio mode stdout belongs to the protocol channel; logs go to stderr
 logging.basicConfig(
     stream=sys.stderr, level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s")
@@ -143,11 +178,11 @@ mcp = _MCPServerBase(name="ebook-translator")
 
 
 # --------------------------------------------------------------------------
-# 缓存目录发现
+# Cache directory discovery
 # --------------------------------------------------------------------------
 
 def _calibre_config_candidates() -> list[Path]:
-    """Calibre 插件配置文件（ebook_translator.json）的可能位置。"""
+    """Candidate locations of the Calibre plugin config (ebook_translator.json)."""
     override = os.environ.get("CALIBRE_CONFIG_DIRECTORY")
     if sys.platform == "win32":
         base = override or os.environ.get("APPDATA") or ""
@@ -163,7 +198,7 @@ def _calibre_config_candidates() -> list[Path]:
 
 
 def cache_root() -> Path:
-    """解析缓存根目录：环境变量 > Calibre 插件配置 > 平台默认路径。"""
+    """Resolve the cache root: env var > Calibre plugin config > platform default."""
     env = os.environ.get("EBOOK_TRANSLATOR_CACHE_DIR")
     if env:
         return Path(env)
@@ -183,11 +218,11 @@ def cache_root() -> Path:
 
 
 # --------------------------------------------------------------------------
-# SQLite 基础设施
+# SQLite infrastructure
 # --------------------------------------------------------------------------
 
 class _ExpectedError(_ToolError, ValueError):
-    """预期内的业务错误：完整消息会透传给 agent。"""
+    """Expected business error: the full message is passed through to the agent."""
 
 
 class BookNotFound(_ExpectedError):
@@ -195,21 +230,22 @@ class BookNotFound(_ExpectedError):
 
 
 def _connect(path: Path) -> sqlite3.Connection:
-    """打开已存在的缓存库；读工具不写，写工具短事务。"""
+    """Open an existing cache database; read tools never write, write tools use short transactions."""
     if not path.is_file():
         raise BookNotFound(
-            f"缓存数据库不存在：{path}（用 list_books 查看可用书籍）")
+            f"Cache database not found: {path} (use list_books to see "
+            f"available books)")
     conn = sqlite3.connect(str(path), timeout=5.0)
-    conn.isolation_level = None  # autocommit；写操作显式 BEGIN IMMEDIATE
+    conn.isolation_level = None  # autocommit; writes use explicit BEGIN IMMEDIATE
     conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
 
 def _available_books_summary(limit: int = 12) -> str:
-    """供错误消息使用：列出当前可用书籍（id + 书名 + 引擎/进度）。"""
+    """For error messages: list the currently available books (id + title + engine/progress)."""
     root = cache_root()
     entries: list[str] = []
-    for sub, persistent in (("cache", ""), ("temp", "，临时")):
+    for sub, persistent in (("cache", ""), ("temp", ", temp")):
         directory = root / sub
         if not directory.is_dir():
             continue
@@ -227,42 +263,48 @@ def _available_books_summary(limit: int = 12) -> str:
             info = scan["info"]
             progress = _progress_payload(scan)
             entries.append(
-                f"{file.stem}《{info.get('title') or file.stem}》"
-                f"（{info.get('engine_name')}→{info.get('target_lang')}，"
-                f"进度 {progress['translated']}/{progress['total_chunks']}"
-                f"{persistent}）")
+                f"{file.stem} '{info.get('title') or file.stem}'"
+                f" ({info.get('engine_name')}->{info.get('target_lang')},"
+                f" progress {progress['translated']}"
+                f"/{progress['total_chunks']}{persistent})")
     if not entries:
-        return "当前缓存目录下没有任何可用书籍"
+        return "no available books under the current cache directory"
     shown = entries[:limit]
-    more = "" if len(entries) <= limit else f" 等 {len(entries)} 本"
-    return "可用书籍：" + "；".join(shown) + more
+    more = "" if len(entries) <= limit else f" ({len(entries)} total)"
+    return "available books: " + "; ".join(shown) + more
 
 
 def _book_path(book_id: str) -> Path:
     if not isinstance(book_id, str) or not _BOOK_ID_PATTERN.match(book_id):
         raise BookNotFound(
-            f"无效的 book_id：{book_id!r}（应使用 list_books 返回的 id）")
+            f"Invalid book_id: {book_id!r} (use the id returned by "
+            f"list_books)")
     root = cache_root()
     for sub in ("cache", "temp"):
         path = root / sub / f"{book_id}.db"
         if path.is_file():
             return path
     raise BookNotFound(
-        f"找不到缓存文件 {book_id}.db。{_available_books_summary()}。"
-        f"若列表为空或缺少此书：确认插件设置中已启用缓存（或高级模式"
-        f"窗口仍打开），且引擎/目标语言/合并设置与分段时一致——缓存"
-        f"文件名由这些配置哈希决定。")
+        f"Cache file {book_id}.db not found. There are {_available_books_summary()}. "
+        f"If the list is empty or this book is missing: make sure caching "
+        f"is enabled in the plugin settings (or the advanced-mode window "
+        f"is still open), and that the engine / target language / merge "
+        f"settings match the ones used for segmentation — the cache file "
+        f"name is derived from a hash of these settings.")
 
 
 def _retry_write(conn: sqlite3.Connection, action) -> None:
-    """短事务写入，遇 locked/busy 自动重试，与插件界面并存时安全。
+    """Short-transaction write with automatic locked/busy retry; safe to
+    run alongside the plugin UI.
 
-    重要：重试期间（最长约 23s = 4 次尝试 × 5s busy_timeout + 退避）
-    **不会向客户端发送任何字节**——若 MCP 客户端的 toolCallTimeoutMs
-    小于实际锁等待时长，客户端会先报 -32001 超时，而本进程仍会在
-    锁释放后完成写入并返回（表现为"报超时但写入实际成功"）。
-    因此 dsh 侧务必配置 toolCallTimeoutMs >= 60000（推荐 120000），
-    且每次锁等待都记录到 stderr 日志以便诊断。"""
+    Important: during retries (up to ~23s = 4 attempts x 5s busy_timeout
+    + backoff) **not a single byte is sent to the client** — if the MCP
+    client's toolCallTimeoutMs is shorter than the actual lock wait, the
+    client reports a -32001 timeout first, while this process still
+    completes the write and returns once the lock is released (appearing
+    as "timed out but the write actually succeeded"). Therefore make sure
+    the client's toolCallTimeoutMs >= 60000 (120000 recommended); every
+    lock wait is also logged to stderr for diagnosis."""
     started = time.perf_counter()
     for attempt in range(4):
         try:
@@ -272,9 +314,11 @@ def _retry_write(conn: sqlite3.Connection, action) -> None:
             waited = time.perf_counter() - started
             if attempt:
                 logging.warning(
-                    "写入在锁等待后成功：第 %d 次尝试，累计等待 %.1fs"
-                    "（锁可能来自 Calibre 界面的写操作；期间客户端收不到"
-                    "任何响应，超时阈值不足会报 -32001 但写入已完成）",
+                    "Write succeeded after waiting for the lock: attempt "
+                    "%d, waited %.1fs in total (the lock likely came from "
+                    "a Calibre UI write; the client received no response "
+                    "during the wait — a too-low timeout threshold "
+                    "reports -32001 even though the write completed)",
                     attempt + 1, waited)
             return
         except sqlite3.OperationalError as e:
@@ -285,14 +329,16 @@ def _retry_write(conn: sqlite3.Connection, action) -> None:
             message = str(e).lower()
             if ("lock" in message or "busy" in message) and attempt < 3:
                 logging.warning(
-                    "数据库被占用（BEGIN IMMEDIATE 第 %d 次失败，已等待 "
-                    "%.1fs，最多再试 %d 次）——正在等待 Calibre 释放写锁",
+                    "Database is busy (BEGIN IMMEDIATE failed on attempt "
+                    "%d, waited %.1fs so far, %d retries left) — waiting "
+                    "for Calibre to release the write lock",
                     attempt + 1, time.perf_counter() - started,
                     3 - attempt)
                 time.sleep(0.5 * (attempt + 1))
                 continue
             raise _ExpectedError(
-                f"数据库写入失败（可能正被 Calibre 长时间占用，请稍后重试）：{e}")
+                f"Database write failed (it may be held by Calibre for a "
+                f"long time; retry later): {e}")
         except Exception:
             try:
                 conn.execute("ROLLBACK")
@@ -317,11 +363,12 @@ def _merge_length(info: dict[str, Any]) -> int:
 
 
 # --------------------------------------------------------------------------
-# chunk 模型（与高级模式界面一一对应）
+# Chunk model (mirroring the advanced-mode UI)
 # --------------------------------------------------------------------------
 
 def _block_count(text: str | None) -> int:
-    """按分隔符（默认空行）切分后的块数，与界面校对面板的行组一致。"""
+    """Number of blocks after splitting by the separator (blank line by
+    default) — same grouping as the row groups in the UI proofing panel."""
     if not text or not text.strip():
         return 0
     return len(_SEPARATOR_PATTERN.split(text.strip()))
@@ -329,9 +376,10 @@ def _block_count(text: str | None) -> int:
 
 def _alignment(original: str | None, translation: str | None,
                merge_enabled: bool) -> dict[str, Any]:
-    """完全复刻插件 Paragraph.is_alignment：
-    开启合并翻译时，译文与原文按空行切分的块数必须一致，否则该行
-    在界面中以黄色高亮提示（Non-aligned）。"""
+    """Exact replica of the plugin's Paragraph.is_alignment: when merged
+    translation is enabled, translation and original must yield the same
+    number of blocks when split by blank lines, otherwise the row is
+    highlighted yellow in the UI (Non-aligned)."""
     if not merge_enabled:
         return {"applicable": False, "aligned": True}
     if translation is None or not translation.strip():
@@ -347,9 +395,10 @@ def _alignment(original: str | None, translation: str | None,
 
 
 def _scan_chunks(conn: sqlite3.Connection) -> dict[str, Any]:
-    """扫描全部未忽略 chunk（与插件 all() 同序，即 rowid 序）。
-    chunk_id 用数据库 cache.id（稳定永不变更）；ui_row 为界面左列
-    显示位置（0 起，删行后会前移，仅供人工对照）。"""
+    """Scan all non-ignored chunks (same order as the plugin's all(),
+    i.e. rowid order). chunk_id is the database cache.id (stable, never
+    changes); ui_row is the UI left-column display position (0-based,
+    shifts up after row deletions; for human reference only)."""
     info = _read_info(conn)
     merge_enabled = _merge_length(info) > 0
     rows = conn.execute(
@@ -362,7 +411,7 @@ def _scan_chunks(conn: sqlite3.Connection) -> dict[str, Any]:
         try:
             chunk_id = int(cid)
         except (TypeError, ValueError):
-            chunk_id = cid  # 非常规 id 原样保留
+            chunk_id = cid  # keep non-numeric ids as-is
         has_translation = bool(
             translation is not None and translation.strip())
         aligned = _alignment(original, translation, merge_enabled)["aligned"]
@@ -391,7 +440,7 @@ def _scan_chunks(conn: sqlite3.Connection) -> dict[str, Any]:
 
 
 def _preview(text: str | None, width: int = 60) -> str:
-    """表格首列式的单行预览（换行折叠为空格）。"""
+    """Single-line preview like the table's first column (newlines collapsed into spaces)."""
     if not text:
         return ""
     collapsed = " ".join(text.split())
@@ -399,18 +448,19 @@ def _preview(text: str | None, width: int = 60) -> str:
 
 
 def _chunk_by_id(scan: dict[str, Any], chunk_id: int) -> dict[str, Any]:
-    """按 chunk_id（数据库 cache.id，稳定不变）取 chunk。"""
+    """Fetch a chunk by chunk_id (the database cache id, stable)."""
     if not isinstance(chunk_id, int) or isinstance(chunk_id, bool):
         raise _ExpectedError(
-            f"chunk_id 必须是整数（数据库缓存 id，见 list_chunks 返回）："
-            f"{chunk_id!r}")
+            f"chunk_id must be an integer (the database cache id; see "
+            f"list_chunks): {chunk_id!r}")
     for chunk in scan["chunks"]:
         if chunk["chunk_id"] == chunk_id:
             return chunk
     raise _ExpectedError(
-        f"chunk_id {chunk_id} 不存在。chunk_id 即数据库缓存 id，永不变更"
-        f"（可用编号以 list_chunks 为准；若该行已在界面删除/被忽略，"
-        f"则不再参与翻译与输出）")
+        f"chunk_id {chunk_id} does not exist. chunk_id is the database "
+        f"cache id and never changes (the valid ids are exactly those "
+        f"returned by list_chunks; if the row was deleted or ignored in "
+        f"the UI it no longer takes part in translation or output)")
 
 
 def _progress_payload(scan: dict[str, Any]) -> dict[str, Any]:
@@ -423,23 +473,28 @@ def _progress_payload(scan: dict[str, Any]) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
-# 工具
+# Tools
 # --------------------------------------------------------------------------
 
 @mcp.tool()
 def list_books(keyword: str = "") -> list[dict[str, Any]]:
-    """列出**所有**翻译缓存书籍及进度（含临时缓存）。返回的 id 即
-    其他工具的 book_id。注意：同一本书用不同引擎/目标语言/合并设置
-    分段会产生多个缓存（书名相同、id 不同）——重名书会带
-    duplicate_title=true 标记，须凭 engine/target_lang/merge_length
-    选定其一；选错书所有后续读写都会落在错误的缓存上，务必先确认。
-    keyword 按书名/引擎/语言模糊过滤（书很多时用）。
-    persistent=false 表示临时缓存（高级模式窗口关闭即销毁）。"""
+    """List **all** cached translation books with progress (including
+    temporary caches). The returned id is the book_id used by every other
+    tool. Note: segmenting the same book with different engine / target
+    language / merge settings produces multiple caches (same title,
+    different ids) — duplicate titles are flagged duplicate_title=true;
+    disambiguate by engine/target_lang/merge_length and pick one, since
+    picking the wrong book makes every later read/write land on the
+    wrong cache. keyword fuzzy-filters by title/engine/language (useful
+    when there are many books). persistent=false means a temporary cache
+    (destroyed as soon as the advanced-mode window closes)."""
     root = cache_root()
     if not root.exists():
         raise BookNotFound(
-            f"缓存根目录不存在：{root}。请先在 Calibre 插件中启用缓存并用"
-            f"高级模式分段，或设置环境变量 EBOOK_TRANSLATOR_CACHE_DIR。")
+            f"Cache root directory does not exist: {root}. Enable the "
+            f"cache in the Calibre plugin and segment a book in advanced "
+            f"mode first, or set the EBOOK_TRANSLATOR_CACHE_DIR "
+            f"environment variable.")
     books: list[dict[str, Any]] = []
     for sub, persistent in (("cache", True), ("temp", False)):
         directory = root / sub
@@ -453,7 +508,7 @@ def list_books(keyword: str = "") -> list[dict[str, Any]]:
             try:
                 scan = _scan_chunks(conn)
             except sqlite3.DatabaseError:
-                continue  # 非有效数据库（残留文件），跳过
+                continue  # not a valid database (leftover file); skip
             finally:
                 conn.close()
             info = scan["info"]
@@ -479,9 +534,12 @@ def list_books(keyword: str = "") -> list[dict[str, Any]]:
             books.append(entry)
     if not books:
         raise BookNotFound(
-            f"在 {root} 下未找到任何缓存。常见原因：插件设置里缓存未启用；"
-            f"或未启用缓存时高级模式窗口已关闭（临时缓存已销毁）。")
-    # 重名书标记：同一书名对应多个缓存（不同引擎/语言/合并设置）
+            f"No caches found under {root}. Common causes: caching is "
+            f"not enabled in the plugin settings; or caching was never "
+            f"enabled and the advanced-mode window has been closed (its "
+            f"temporary cache is destroyed).")
+    # Duplicate-title flag: one title with multiple caches (different
+    # engine/language/merge settings)
     title_counts: dict[str, int] = {}
     for entry in books:
         title_counts[entry["title"]] = title_counts.get(entry["title"], 0) + 1
@@ -489,15 +547,17 @@ def list_books(keyword: str = "") -> list[dict[str, Any]]:
         if title_counts[entry["title"]] > 1:
             entry["duplicate_title"] = True
             entry["disambiguation_note"] = (
-                "书名重复：同一书存在多个缓存，请凭 engine/target_lang/"
-                "merge_length/persistent 确认后选定其一，全流程只用同一 id")
+                "Duplicate title: this book has multiple caches. Confirm "
+                "by engine/target_lang/merge_length/persistent, pick "
+                "exactly one, and use the same id for the whole run")
     return books
 
 
 @mcp.tool()
 def get_book_info(book_id: str) -> dict[str, Any]:
-    """查看某本书缓存的详情：引擎、目标语言、合并/对齐规则、进度，
-    以及未对齐（界面黄色高亮）的编号清单。"""
+    """Details of one book's cache: engine, target language, merge /
+    alignment rules, progress, and the list of non-aligned (yellow-
+    highlighted) chunk ids."""
     conn = _connect(_book_path(book_id))
     try:
         scan = _scan_chunks(conn)
@@ -511,20 +571,28 @@ def get_book_info(book_id: str) -> dict[str, Any]:
             "merge_length": _merge_length(info),
             "merge_translation_enabled": merge_enabled,
             "alignment_rule": (
-                f"译文与原文按空行（{_SEPARATOR!r}）切分后的块数必须一致，"
-                f"否则该编号在插件界面中黄色高亮（Non-aligned）"
+                f"Translation and original must split into the same "
+                f"number of blocks by blank lines ({_SEPARATOR!r}); "
+                f"otherwise the chunk is highlighted yellow in the "
+                f"plugin UI (Non-aligned)"
                 if merge_enabled else
-                "合并翻译未启用，界面不做对齐校验"),
+                "Merged translation is disabled; the UI performs no "
+                "alignment check"),
             "non_aligned_chunks": scan["non_aligned_chunks"],
             "identity_note": (
-                "chunk_id 即数据库缓存 id，永不变更：界面删行不影响任何"
-                "chunk 的编号，出问题只需重做单个 chunk（delete_translations"
-                " + write_chunk）；界面左列显示位置见各工具返回的 ui_row，"
-                "仅供人工对照。缓存文件由 书籍+引擎+目标语言+合并设置 唯一"
-                "决定，重新打开高级模式须用相同配置"),
+                "chunk_id is the database cache id and never changes: "
+                "deleting rows in the UI does not renumber any chunk, and "
+                "a broken chunk only needs its own redo "
+                "(delete_translations + write_chunk). The UI left-column "
+                "display position is returned as ui_row and is for human "
+                "reference only. The cache file is uniquely determined by "
+                "book + engine + target language + merge settings; reopen "
+                "advanced mode with the same settings"),
             "output_hint": (
-                "全部译完后：在 Calibre 中以相同引擎/语言/合并设置重新打开"
-                "高级模式（表格会加载已写入的译文），核对后点 Output 输出"),
+                "When everything is translated: reopen advanced mode in "
+                "Calibre with the same engine/language/merge settings "
+                "(the table loads the written translations), review, "
+                "then click Output to produce the ebook"),
             **_progress_payload(scan),
         }
     finally:
@@ -537,17 +605,21 @@ def list_chunks(
     status: str = "all",
     keyword: str = "",
 ) -> dict[str, Any]:
-    """轻量列出某本书全部编号（chunk）的状态，不含全文（避免撑爆
-    上下文），形态对应界面左列表格。status 可选：all / untranslated /
-    translated / misaligned（界面黄色高亮行）；keyword 模糊匹配原文
-    或译文。每条含：chunk_id（寻址用，永不变更，仅本书内有效）、
-    ui_row（界面左列显示位置，仅供人工对照）、状态、是否对齐、块数、
-    字符数、单行预览。所有工具一律以 book_id+chunk_id 寻址，不要用
-    ui_row，也不要把本书的 chunk_id 用于其他书。返回外层回显
-    book_id 与书名，供调用方核对是否在操作预期的书。"""
+    """Lightweight list of every chunk id of one book with status, without
+    full texts (to keep context small); mirrors the left-hand table of
+    the UI. status options: all / untranslated / translated / misaligned
+    (the UI's yellow rows); keyword fuzzy-matches original or translation
+    text. Each item contains: chunk_id (for addressing; never changes;
+    valid only inside this book), ui_row (UI display position, human
+    reference only), status, alignment, block count, character count and
+    a one-line preview. Always address chunks as book_id + chunk_id —
+    never use ui_row, and never carry this book's chunk_id over to
+    another book. The response echoes book_id and title so the caller
+    can verify it is working on the intended book."""
     if status not in ("all", "untranslated", "translated", "misaligned"):
         raise _ExpectedError(
-            "status 只能是 all / untranslated / translated / misaligned")
+            "status must be one of all / untranslated / translated / "
+            "misaligned")
     conn = _connect(_book_path(book_id))
     try:
         scan = _scan_chunks(conn)
@@ -560,7 +632,8 @@ def list_chunks(
                 continue
             if status == "misaligned" and (
                     not chunk["translated"] or chunk["aligned"]):
-                # 黄色高亮只作用于已译且块数不一致的行
+                # yellow highlighting applies only to translated rows
+                # with mismatched block counts
                 continue
             if keyword:
                 haystack = (
@@ -597,12 +670,15 @@ def get_original(
     chunk_id: int,
     include_raw: bool = False,
 ) -> dict[str, Any]:
-    """读取一个编号（chunk）的完整原文——与界面"校对"面板显示的
-    原文一致，agent 拿到的与人类看到的相同。chunk_id 为该书数据库
-    缓存 id（永不变更，见 list_chunks；仅在 book_id 这本书内有效，
-    勿跨书使用）。合并翻译开启时附带 blocks：译文的空行块数必须与
-    该数一致才能对齐（否则界面黄色高亮）。include_raw=True 时额外
-    返回原始 HTML。响应回显 book_id 与书名，请核对是否为目标书。"""
+    """Read the full original text of one chunk — identical to what the
+    UI's proofreading panel shows, so the agent sees the same text a
+    human sees. chunk_id is this book's database cache id (never changes;
+    see list_chunks; valid only inside this book — never use it across
+    books). When merged translation is enabled the response includes
+    blocks: the translation's blank-line block count must equal it to be
+    aligned (otherwise the UI highlights the chunk yellow).
+    include_raw=True additionally returns the raw HTML. The response
+    echoes book_id and title — verify it is the intended book."""
     conn = _connect(_book_path(book_id))
     try:
         scan = _scan_chunks(conn)
@@ -614,7 +690,7 @@ def get_original(
             "title": scan["info"].get("title"),
             "status": "translated" if chunk["translated"]
                       else "untranslated",
-            # 与界面校对面板一致：显示 strip 后的原文
+            # same as the UI proofreading panel: show the stripped original
             "original": (chunk["original"] or "").strip(),
             "merge_enabled": scan["merge_enabled"],
         }
@@ -633,12 +709,15 @@ def get_original(
 
 @mcp.tool()
 def get_translation(book_id: str, chunk_id: int) -> dict[str, Any]:
-    """读取一个编号（chunk）的完整译文与对齐状态——与界面"校对"
-    面板显示的译文一致。chunk_id 为该书数据库缓存 id（永不变更，
-    见 list_chunks；仅在 book_id 这本书内有效，勿跨书使用）。
-    未翻译时 translation 为 null。合并翻译开启时附带对齐判定
-    （译文与原文的空行块数是否一致，即界面是否黄色高亮）。
-    响应回显 book_id 与书名，请核对是否为目标书。"""
+    """Read the full translation and alignment state of one chunk —
+    identical to what the UI's proofreading panel shows. chunk_id is
+    this book's database cache id (never changes; see list_chunks; valid
+    only inside this book — never use it across books). translation is
+    null when the chunk is untranslated. When merged translation is
+    enabled the response carries the alignment verdict (whether
+    translation and original have equal blank-line block counts, i.e.
+    whether the UI highlights the row yellow). The response echoes
+    book_id and title — verify it is the intended book."""
     conn = _connect(_book_path(book_id))
     try:
         scan = _scan_chunks(conn)
@@ -652,7 +731,7 @@ def get_translation(book_id: str, chunk_id: int) -> dict[str, Any]:
             "title": scan["info"].get("title"),
             "status": "translated" if chunk["translated"]
                       else "untranslated",
-            # 与界面校对面板一致：显示 strip 后的译文
+            # same as the UI proofreading panel: show the stripped translation
             "translation": chunk["translation"].strip()
             if chunk["translation"] else None,
             "merge_enabled": scan["merge_enabled"],
@@ -678,16 +757,19 @@ def write_chunk(
     translation: str,
     overwrite: bool = True,
 ) -> dict[str, Any]:
-    """写入一个编号（chunk）的完整译文（写前自动 strip，与插件行为
-    一致；登记引擎名与目标语言）。chunk_id 为该书数据库缓存 id
-    （永不变更，见 list_chunks；仅在 book_id 这本书内有效）。
-    写回后立即复刻界面对齐判定并返回 aligned 状态——若块数不一致
-    会带 warning（该编号将在界面中黄色高亮）。overwrite=False 时
-    该编号已有译文则跳过。响应回显 book_id 与书名：写入是不可逆
-    操作，请先核对是否为目标书。"""
+    """Write the full translation of one chunk (stripped before writing,
+    matching plugin behavior; engine name and target language are
+    recorded). chunk_id is this book's database cache id (never changes;
+    see list_chunks; valid only inside this book). Right after writing,
+    the tool replicates the UI alignment check and returns the aligned
+    state — mismatched block counts come with a warning (the chunk will
+    be highlighted yellow in the UI). With overwrite=False an existing
+    translation is skipped. The response echoes book_id and title:
+    writing is irreversible, verify it is the intended book first."""
     if not isinstance(translation, str) or not translation.strip():
         raise _ExpectedError(
-            "译文不能为空；清除译文请用 delete_translations")
+            "translation must not be empty; use delete_translations to "
+            "clear a translation")
     text = translation.strip()
     conn = _connect(_book_path(book_id))
     try:
@@ -711,7 +793,8 @@ def write_chunk(
                 (text, _ENGINE_NAME, target_lang, chunk["rowid"]))
         _retry_write(conn, action)
 
-        # 写后重新扫描，返回与界面一致的对齐状态与最新进度
+        # rescan after the write: return the UI-consistent alignment state
+        # and fresh progress
         scan = _scan_chunks(conn)
         updated = _chunk_by_id(scan, chunk["chunk_id"])
         alignment = _alignment(
@@ -728,9 +811,11 @@ def write_chunk(
         }
         if scan["merge_enabled"] and not alignment["aligned"]:
             result["warning"] = (
-                f"对齐警告：原文 {alignment['original_blocks']} 块 / "
-                f"译文 {alignment['translation_blocks']} 块（按空行切分须"
-                f"一致，否则该编号在插件界面中黄色高亮 Non-aligned）")
+                f"Alignment warning: original has "
+                f"{alignment['original_blocks']} blocks / translation has "
+                f"{alignment['translation_blocks']} blocks (blank-line "
+                f"block counts must match, otherwise this chunk is "
+                f"highlighted yellow in the plugin UI as Non-aligned)")
         return result
     finally:
         conn.close()
@@ -741,12 +826,14 @@ def delete_translations(
     book_id: str,
     chunk_ids: list[int],
 ) -> dict[str, Any]:
-    """清空指定编号（chunk）的译文（用于重译），原文与其他字段不受
-    影响。chunk_ids 为该书数据库缓存 id 列表（永不变更，见
-    list_chunks；仅在 book_id 这本书内有效）。某个 chunk 出问题只需
-    重做它自己，不影响其他 chunk。响应回显 book_id 与书名，请核对。"""
+    """Clear the translations of the given chunks (for rework); originals
+    and all other fields are untouched. chunk_ids is a list of this
+    book's database cache ids (never change; see list_chunks; valid only
+    inside this book). A chunk that went wrong only needs its own redo —
+    other chunks are not affected. The response echoes book_id and
+    title; verify them."""
     if not chunk_ids:
-        raise _ExpectedError("chunk_ids 列表不能为空")
+        raise _ExpectedError("chunk_ids must not be an empty list")
     conn = _connect(_book_path(book_id))
     try:
         scan = _scan_chunks(conn)
@@ -786,22 +873,24 @@ def delete_translations(
 
 
 # --------------------------------------------------------------------------
-# 入口
+# Entry point
 # --------------------------------------------------------------------------
 
 def _selftest() -> None:
     root = cache_root()
-    print(f"缓存根目录: {root}")
+    print(f"Cache root: {root}")
     try:
         for book in list_books():
-            persistent = "持久" if book["persistent"] else "临时"
-            print(f"  [{persistent}] {book['id']}  《{book['title']}》"
-                  f"  引擎={book['engine']}  目标语言={book['target_lang']}"
-                  f"  进度={book['translated']}/{book['total_chunks']} chunk"
-                  f"  未对齐={book['non_aligned']}")
-        print("自检通过：缓存目录可访问，以上书籍可被 MCP 工具读写。")
+            persistent = "persistent" if book["persistent"] else "temp"
+            print(f"  [{persistent}] {book['id']}  '{book['title']}'"
+                  f"  engine={book['engine']}"
+                  f"  target_lang={book['target_lang']}"
+                  f"  progress={book['translated']}/{book['total_chunks']}"
+                  f" chunks  non_aligned={book['non_aligned']}")
+        print("Self-test passed: the cache directory is accessible and the"
+              " books above can be read and written by the MCP tools.")
     except BookNotFound as e:
-        print(f"提示: {e}")
+        print(f"Note: {e}")
         sys.exit(1)
 
 
