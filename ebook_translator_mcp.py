@@ -103,6 +103,10 @@ Tools
                            chunk
     write_chunk            write the translation of one chunk, reports
                            alignment
+    write_chunk_from_file  write one chunk's translation from a local
+                           .txt file (path only: zero content tokens,
+                           no truncation risk on huge chunks; BOM
+                           stripped, CRLF normalized, readback-verified)
     delete_translations    clear translations of given chunks (for
                            rework)
 
@@ -126,7 +130,9 @@ EBOOK_TRANSLATOR_ENGINE_NAME   Engine name recorded with written
 EBOOK_TRANSLATOR_SEPARATOR     Separator used for alignment checks;
                                default "\\n\\n" (same as the plugin's
                                built-in engine separator; usually
-                               leave it alone)
+                               leave it alone). The file tool's
+                               CRLF->LF normalization applies only
+                               while this separator is LF-based.
 
 Running
 -------
@@ -473,6 +479,157 @@ def _progress_payload(scan: dict[str, Any]) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
+# Translation file ingestion + shared write path
+# --------------------------------------------------------------------------
+
+def _read_translation_file(file_path: str) -> tuple[str, Path]:
+    """Read a translation file for write_chunk_from_file; return
+    (text, resolved_path).
+
+    Why a file tool exists: for large chunks (tens of thousands of
+    characters) making the agent re-type the translation as a tool
+    argument costs huge tokens and risks silent truncation/mutation in
+    transit. With a file path the agent never touches the content: the
+    local file is the source of truth, the cache becomes a mirror.
+
+    Deliberate choices (each addresses a real-world pitfall):
+    * utf-8-sig decoding — transparently strips a UTF-8 BOM (EF BB BF)
+      when present. Some editors/tools write one; a BOM would silently
+      prepend U+FEFF to the first character of the stored translation.
+      Files that are not valid UTF-8 are rejected with a clear error —
+      no silent encoding guessing (a wrongly auto-decoded GBK file
+      would store mojibake).
+    * CRLF/CR -> LF normalization, but only while the configured
+      alignment separator is LF-based (the default "\\n\\n" and any
+      other "\\n"-only separator): the alignment check splits on the
+      literal separator, so text stored with CRLF could never match an
+      LF separator (every multi-block chunk would be flagged
+      misaligned). The plugin's own engines also store LF, so this
+      matches the cache's existing convention. If the separator itself
+      contains "\\r" (an exotic CRLF-based separator), CR characters
+      are part of the alignment split and are preserved verbatim.
+    * Leading/trailing whitespace is stripped — exactly like
+      write_chunk (same strip, same stored result for the same text;
+      only CRLF input can differ, normalized as above under the
+      default LF separator).
+    """
+    if not isinstance(file_path, str) or not file_path.strip():
+        raise _ExpectedError(
+            "file_path must be a non-empty string (absolute path "
+            "recommended; relative paths resolve against the server "
+            "process's working directory, which may differ from the "
+            "caller's)")
+    path = Path(file_path.strip()).expanduser()
+    if not path.is_absolute():
+        # Relative paths resolve against THIS process's working
+        # directory — the caller's cwd is not visible here and may be
+        # different. The resolved path is echoed back as source_file.
+        path = Path.cwd() / path
+    try:
+        data = path.read_bytes()
+    except OSError as e:
+        raise _ExpectedError(
+            f"Cannot read file {path}: {e} (pass an existing UTF-8 "
+            f"text file; relative paths resolve against the server's "
+            f"working directory — prefer absolute paths)")
+    if not data:
+        raise _ExpectedError(
+            f"File is empty: {path} (the translation would be empty; "
+            f"use delete_translations to clear a translation instead)")
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError as e:
+        raise _ExpectedError(
+            f"File is not valid UTF-8: {path} ({e}). Re-save the file "
+            f"as UTF-8 (a UTF-8 BOM is fine — it is stripped "
+            f"automatically) and retry")
+    # Normalize CRLF/CR to LF only while the configured separator is
+    # LF-based; if the separator itself contains "\r", CR is part of
+    # the alignment split and must survive into the database verbatim.
+    if "\r" not in _SEPARATOR:
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = text.strip()
+    if not text:
+        raise _ExpectedError(
+            f"File contains only whitespace: {path} (the translation "
+            f"would be empty)")
+    return text, path
+
+
+def _write_translation(
+    conn: sqlite3.Connection,
+    book_id: str,
+    scan: dict[str, Any],
+    chunk: dict[str, Any],
+    text: str,
+    overwrite: bool,
+) -> dict[str, Any]:
+    """Shared write path of write_chunk and write_chunk_from_file.
+
+    Keeping one implementation guarantees the two tools store identical
+    content (same strip, same UPDATE) and return identical structures —
+    the file variant only adds the source_file echo and (on failure)
+    the verify_mismatch flag.
+
+    Readback verification: after writing, the stored text is re-read
+    from the database (the rescan below) and compared with `text`. On
+    mismatch the response carries verify_mismatch: true — a last line
+    of defense so the caller never has to trust a write blindly (the
+    field is absent when the readback matches)."""
+    if chunk["translated"] and not overwrite:
+        return {
+            "book_id": book_id,
+            "title": scan["info"].get("title"),
+            "chunk_id": chunk["chunk_id"], "ui_row": chunk["ui_row"],
+            "written": False,
+            "skipped_existing": True,
+            "progress": _progress_payload(scan),
+        }
+    target_lang = scan["info"].get("target_lang")
+
+    def action() -> None:
+        conn.execute(
+            "UPDATE cache SET translation = ?, engine_name = ?,"
+            " target_lang = ? WHERE rowid = ?",
+            (text, _ENGINE_NAME, target_lang, chunk["rowid"]))
+    _retry_write(conn, action)
+
+    # rescan after the write: return the UI-consistent alignment state
+    # and fresh progress — the same re-read doubles as the readback
+    # verification below
+    scan = _scan_chunks(conn)
+    updated = _chunk_by_id(scan, chunk["chunk_id"])
+    alignment = _alignment(
+        updated["original"], updated["translation"], scan["merge_enabled"])
+    result: dict[str, Any] = {
+        "book_id": book_id,
+        "title": scan["info"].get("title"),
+        "chunk_id": updated["chunk_id"],
+        "ui_row": updated["ui_row"],
+        "written": True,
+        "characters": len(text),
+        "alignment": alignment,
+        "progress": _progress_payload(scan),
+    }
+    if updated["translation"] != text:
+        # Theoretically unreachable; kept as a hard guarantee for the
+        # caller: an absent verify_mismatch field means "verified".
+        result["verify_mismatch"] = True
+        result["verify_note"] = (
+            "Readback verification failed: the text stored in the cache "
+            "differs from the text that was submitted. Do not trust "
+            "this write; inspect with get_translation and retry")
+    if scan["merge_enabled"] and not alignment["aligned"]:
+        result["warning"] = (
+            f"Alignment warning: original has "
+            f"{alignment['original_blocks']} blocks / translation has "
+            f"{alignment['translation_blocks']} blocks (blank-line "
+            f"block counts must match, otherwise this chunk is "
+            f"highlighted yellow in the plugin UI as Non-aligned)")
+    return result
+
+
+# --------------------------------------------------------------------------
 # Tools
 # --------------------------------------------------------------------------
 
@@ -763,9 +920,13 @@ def write_chunk(
     see list_chunks; valid only inside this book). Right after writing,
     the tool replicates the UI alignment check and returns the aligned
     state — mismatched block counts come with a warning (the chunk will
-    be highlighted yellow in the UI). With overwrite=False an existing
-    translation is skipped. The response echoes book_id and title:
-    writing is irreversible, verify it is the intended book first."""
+    be highlighted yellow in the UI), and the stored text is read back
+    and verified (verify_mismatch appears only if it differs). With
+    overwrite=False an existing translation is skipped. The response
+    echoes book_id and title: writing is irreversible, verify it is the
+    intended book first. For very large translations prefer
+    write_chunk_from_file (file-based: zero content tokens, no
+    truncation risk)."""
     if not isinstance(translation, str) or not translation.strip():
         raise _ExpectedError(
             "translation must not be empty; use delete_translations to "
@@ -775,47 +936,58 @@ def write_chunk(
     try:
         scan = _scan_chunks(conn)
         chunk = _chunk_by_id(scan, chunk_id)
-        if chunk["translated"] and not overwrite:
-            return {
-                "book_id": book_id,
-                "title": scan["info"].get("title"),
-                "chunk_id": chunk["chunk_id"], "ui_row": chunk["ui_row"],
-                "written": False,
-                "skipped_existing": True,
-                "progress": _progress_payload(scan),
-            }
-        target_lang = scan["info"].get("target_lang")
+        return _write_translation(
+            conn, book_id, scan, chunk, text, overwrite)
+    finally:
+        conn.close()
 
-        def action() -> None:
-            conn.execute(
-                "UPDATE cache SET translation = ?, engine_name = ?,"
-                " target_lang = ? WHERE rowid = ?",
-                (text, _ENGINE_NAME, target_lang, chunk["rowid"]))
-        _retry_write(conn, action)
 
-        # rescan after the write: return the UI-consistent alignment state
-        # and fresh progress
+@mcp.tool()
+def write_chunk_from_file(
+    book_id: str,
+    chunk_id: int,
+    file_path: str,
+    overwrite: bool = True,
+) -> dict[str, Any]:
+    """Write one chunk's translation from a local text (.txt) file — the
+    recommended path for large translations. The agent passes only a
+    file path, never the content: zero token cost for the text and no
+    risk of truncation or mutation in transit. Whatever is in the file
+    is exactly what gets stored (the local file is the source of truth,
+    the cache is the mirror).
+
+    File handling: the file must exist and be valid UTF-8. A UTF-8 BOM
+    is stripped automatically; leading/trailing whitespace is stripped
+    exactly like write_chunk; and — with the default LF-based alignment
+    separator — CRLF/CR line endings are normalized to LF (text stored
+    with CRLF could never match an LF separator and every multi-block
+    chunk would be flagged misaligned). If the configured separator
+    itself contains CR, line endings are preserved verbatim instead.
+    Empty or whitespace-only files are rejected. Relative paths resolve
+    against the server process's working directory, which may differ
+    from the caller's — absolute paths are strongly recommended (the
+    resolved path is echoed back as source_file so mismatches are
+    visible).
+
+    The response has the same structure as write_chunk (written /
+    characters / alignment / progress / warning), plus source_file.
+    After writing, the stored text is read back and compared inside
+    this tool: if verify_mismatch is present (true), the stored text
+    differs from the file — do not trust the write; inspect with
+    get_translation and retry. overwrite=False skips chunks that
+    already have a translation. chunk_id is this book's database cache
+    id (see list_chunks); the response echoes book_id and title —
+    verify it is the intended book."""
+    text, path = _read_translation_file(file_path)
+    conn = _connect(_book_path(book_id))
+    try:
         scan = _scan_chunks(conn)
-        updated = _chunk_by_id(scan, chunk["chunk_id"])
-        alignment = _alignment(
-            updated["original"], updated["translation"], scan["merge_enabled"])
-        result: dict[str, Any] = {
-            "book_id": book_id,
-            "title": scan["info"].get("title"),
-            "chunk_id": updated["chunk_id"],
-            "ui_row": updated["ui_row"],
-            "written": True,
-            "characters": len(text),
-            "alignment": alignment,
-            "progress": _progress_payload(scan),
-        }
-        if scan["merge_enabled"] and not alignment["aligned"]:
-            result["warning"] = (
-                f"Alignment warning: original has "
-                f"{alignment['original_blocks']} blocks / translation has "
-                f"{alignment['translation_blocks']} blocks (blank-line "
-                f"block counts must match, otherwise this chunk is "
-                f"highlighted yellow in the plugin UI as Non-aligned)")
+        chunk = _chunk_by_id(scan, chunk_id)
+        result = _write_translation(
+            conn, book_id, scan, chunk, text, overwrite)
+        # echo the resolved path: with relative paths the caller can
+        # immediately see which file the server actually read
+        result["source_file"] = str(path)
         return result
     finally:
         conn.close()

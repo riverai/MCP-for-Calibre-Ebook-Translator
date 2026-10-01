@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ebook-translator-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "MCP server that reads and writes the translation cache of the Calibre Ebook-Translator plugin"
 readme = "README.md"
 license = { text = "MIT" }

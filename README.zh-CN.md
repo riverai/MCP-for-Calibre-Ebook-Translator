@@ -14,7 +14,7 @@
 
 ## 工作原理
 
-Ebook Translator 插件把每本书的翻译进度存放在 SQLite 缓存里。本服务器以读写方式打开这些缓存文件,暴露七个工具:列书、查看编号状态、读取原文、读取/写入译文、清除译文(重译用)。每个响应都回显 book_id 与书名,agent(和你)随时可以核对操作落在哪本书上。
+Ebook Translator 插件把每本书的翻译进度存放在 SQLite 缓存里。本服务器以读写方式打开这些缓存文件,暴露八个工具:列书、查看编号状态、读取原文、读取或写入译文(直接传文本,或从本地文件读入)、清除译文(重译用)。每个响应都回显 book_id 与书名,agent(和你)随时可以核对操作落在哪本书上。
 
 核心特性:
 
@@ -28,7 +28,7 @@ Ebook Translator 插件把每本书的翻译进度存放在 SQLite 缓存里。�
 - Python 3.10+(建议从 [python.org](https://www.python.org/downloads/) 安装;Windows 上避开 Microsoft Store 版,见[故障排查](#故障排查))
 - 任意支持 stdio 服务器的 MCP 客户端
 
-## 安装和自检
+## 安装
 
 **方式 A——用 [uv](https://docs.astral.sh/uv/) 直接运行(免安装、免克隆):**
 
@@ -107,6 +107,7 @@ python ebook_translator_mcp.py --transport http --port 8420
 | `get_original` | 读取一个编号的完整原文——与插件校对面板显示的完全一致 |
 | `get_translation` | 读取一个编号的完整译文与对齐判定(`yellow_warning` = 界面会高亮) |
 | `write_chunk` | 写入一个编号的译文;返回对齐状态,块数不一致时附带 `warning` |
+| `write_chunk_from_file` | 从本地 `.txt` 文件写入一个编号的译文——只传路径不传正文:大块翻译零 token 消耗、无截断/篡改风险;自动剥 UTF-8 BOM、CRLF 归一为 LF,写入后同一次调用内回读校验 |
 | `delete_translations` | 清空指定编号的译文(重译用);原文不受影响 |
 
 ## 寻址模型
@@ -137,7 +138,7 @@ agent 翻译、写回后立刻就能看到该行会不会变黄——在你打�
 2. `get_book_info` → 记下合并设置和已有的未对齐编号
 3. `list_chunks` 用 `status="untranslated"` → 挑一个编号
 4. `get_original` → 在对话里翻译(开合并时保持块数一致)
-5. `write_chunk` → 检查响应里的 `alignment.aligned`
+5. `write_chunk`(大块翻译用 `write_chunk_from_file`——传本地文件路径,正文不经过对话)→ 检查响应里的 `alignment.aligned`;没有 `verify_mismatch` 字段即代表写入已验证
 6. 不对齐?重写该编号(或先 `delete_translations`)直到对齐
 7. 重复,直到 `list_chunks` 的 `status="misaligned"` 返回空
 8. 人工步骤:在 Calibre 用相同引擎/语言/合并设置重开高级模式,核对后点 **Output**

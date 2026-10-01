@@ -10,13 +10,11 @@ An [MCP](https://modelcontextprotocol.io) server that lets any AI agent (Claude 
 
 The plugin keeps doing what it is good at (parsing ebooks, splitting text into numbered chunks, merging output). The agent does the translation in your chat window, using any model you like. The book never leaves your machine: everything happens through local SQLite cache files.
 
-![插件自检](https://github.com/user-attachments/assets/8577f6b4-fab9-4210-9eb7-5622afab97be)
-<img width="1954" height="1617" alt="image" src="https://github.com/user-attachments/assets/5c9cda99-e8ca-46e1-92ff-03b5a52171a1" />
-
+![The plugin's advanced mode: each numbered row is one chunk the MCP tools can read and write](https://github.com/user-attachments/assets/8577f6b4-fab9-4210-9eb7-5622afab97be)
 
 ## How it works
 
-The Ebook Translator plugin stores each book's translation progress in a SQLite cache. This server opens those cache files read/write and exposes seven tools: list books, inspect chunk status, read a chunk's original text, read or write its translation, and clear translations for rework. Every response echoes the book id and title so the agent (and you) can always verify which book is being touched.
+The Ebook Translator plugin stores each book's translation progress in a SQLite cache. This server opens those cache files read/write and exposes eight tools: list books, inspect chunk status, read a chunk's original text, read or write its translation — inline or from a local file — and clear translations for rework. Every response echoes the book id and title so the agent (and you) can always verify which book is being touched.
 
 Key properties:
 
@@ -30,7 +28,7 @@ Key properties:
 - Python 3.10+ (from [python.org](https://www.python.org/downloads/) — on Windows, avoid the Microsoft Store stub, see [Troubleshooting](#troubleshooting))
 - Any MCP client that supports stdio servers
 
-## Install and selftest
+## Install
 
 **Option A — run directly with [uv](https://docs.astral.sh/uv/) (no install, no clone):**
 
@@ -109,6 +107,7 @@ python ebook_translator_mcp.py --transport http --port 8420
 | `get_original` | Full original text of one chunk — exactly what the plugin's proofreading panel shows |
 | `get_translation` | Full translation of one chunk plus the alignment verdict (`yellow_warning` = will be highlighted in the UI) |
 | `write_chunk` | Write one chunk's translation; returns alignment state and a `warning` if the block counts mismatch |
+| `write_chunk_from_file` | Write one chunk's translation from a local `.txt` file — pass a path instead of the text: zero content tokens, no truncation/hallucination risk on large chunks; UTF-8 BOM stripped, CRLF normalized to LF, and the stored text is read back and verified in the same call |
 | `delete_translations` | Clear translations of the given chunks (for rework); originals untouched |
 
 ## Addressing model
@@ -139,7 +138,7 @@ So an agent can translate, write, and immediately see whether the row would go y
 2. `get_book_info` → note merge settings and existing non-aligned chunks
 3. `list_chunks` with `status="untranslated"` → pick a chunk
 4. `get_original` → translate it in the chat (keep the block count if merging is on)
-5. `write_chunk` → check `alignment.aligned` in the response
+5. `write_chunk` (or `write_chunk_from_file` for large chunks — pass a local file path so the text never passes through the chat) → check `alignment.aligned` in the response, and treat a missing `verify_mismatch` as "write verified"
 6. Misaligned? Rewrite the chunk (or `delete_translations` first) until aligned
 7. Repeat until `list_chunks` with `status="misaligned"` comes back empty
 8. Human step: reopen advanced mode in Calibre with the same engine/language/merge settings, review, then click **Output**
