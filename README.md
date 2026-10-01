@@ -14,7 +14,7 @@ The plugin keeps doing what it is good at (parsing ebooks, splitting text into n
 
 ## How it works
 
-The Ebook Translator plugin stores each book's translation progress in a SQLite cache. This server opens those cache files read/write and exposes eight tools: list books, inspect chunk status, read a chunk's original text, read or write its translation — inline or from a local file — and clear translations for rework. Every response echoes the book id and title so the agent (and you) can always verify which book is being touched.
+The Ebook Translator plugin stores each book's translation progress in a SQLite cache. This server opens those cache files read/write and exposes ten tools: list books, inspect chunk status, read a chunk's original text, read or write its translation — inline or via local files — and clear translations for rework. Every response echoes the book id and title so the agent (and you) can always verify which book is being touched.
 
 Key properties:
 
@@ -105,10 +105,14 @@ python ebook_translator_mcp.py --transport http --port 8420
 | `get_book_info` | One book's engine, target language, merge/alignment rule, progress, and the list of non-aligned chunk ids |
 | `list_chunks` | Lightweight per-chunk status table (no full texts); filter by `status` (`all`/`untranslated`/`translated`/`misaligned`) or `keyword` |
 | `get_original` | Full original text of one chunk — exactly what the plugin's proofreading panel shows |
+| `get_original_to_file` | Export one chunk's original to a local file — returns only metadata; the text itself never enters the conversation |
 | `get_translation` | Full translation of one chunk plus the alignment verdict (`yellow_warning` = will be highlighted in the UI) |
+| `get_translation_to_file` | Export one chunk's current translation to a local file (metadata + alignment only) — for offline rework, human review, or migrating to a new cache |
 | `write_chunk` | Write one chunk's translation; returns alignment state and a `warning` if the block counts mismatch |
 | `write_chunk_from_file` | Write one chunk's translation from a local `.txt` file — pass a path instead of the text: zero content tokens, no truncation/hallucination risk on large chunks; UTF-8 BOM stripped, CRLF normalized to LF, and the stored text is read back and verified in the same call |
 | `delete_translations` | Clear translations of the given chunks (for rework); originals untouched |
+
+For large chunks, prefer the **file pipeline**: `get_original_to_file` exports the original to a local file, the agent translates against that file, and `write_chunk_from_file` stores the result — bulk text never passes through the conversation (no token cost, no truncation or hallucination risk). `get_translation_to_file` closes the rework loop: export a misaligned translation, fix its block count offline, write it back.
 
 ## Addressing model
 
@@ -137,9 +141,9 @@ So an agent can translate, write, and immediately see whether the row would go y
 1. `list_books` → pick the right `book_id` (watch `duplicate_title`)
 2. `get_book_info` → note merge settings and existing non-aligned chunks
 3. `list_chunks` with `status="untranslated"` → pick a chunk
-4. `get_original` → translate it in the chat (keep the block count if merging is on)
+4. `get_original` → translate it in the chat (keep the block count if merging is on); or `get_original_to_file` to export it to a file and translate against the file (recommended for large chunks)
 5. `write_chunk` (or `write_chunk_from_file` for large chunks — pass a local file path so the text never passes through the chat) → check `alignment.aligned` in the response, and treat a missing `verify_mismatch` as "write verified"
-6. Misaligned? Rewrite the chunk (or `delete_translations` first) until aligned
+6. Misaligned? Rewrite the chunk (or `delete_translations` first) until aligned — for large chunks: `get_translation_to_file` + fix the block count offline + `write_chunk_from_file`
 7. Repeat until `list_chunks` with `status="misaligned"` comes back empty
 8. Human step: reopen advanced mode in Calibre with the same engine/language/merge settings, review, then click **Output**
 

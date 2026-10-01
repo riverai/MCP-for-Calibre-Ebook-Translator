@@ -99,8 +99,13 @@ Tools
     list_chunks            lightweight status table (no full texts;
                            filterable by status)
     get_original           full original text of one chunk
+    get_original_to_file   export one chunk's original to a local file
+                           (metadata only: bulk text stays out of the
+                           conversation)
     get_translation        full translation + alignment state of one
                            chunk
+    get_translation_to_file export one chunk's translation to a local
+                           file (offline rework / review / migration)
     write_chunk            write the translation of one chunk, reports
                            alignment
     write_chunk_from_file  write one chunk's translation from a local
@@ -110,10 +115,27 @@ Tools
     delete_translations    clear translations of given chunks (for
                            rework)
 
+File pipeline (token-safe bulk text)
+------------------------------------
+    get_original_to_file and write_chunk_from_file form a symmetric
+    pair: originals flow cache -> file, translations flow file ->
+    cache. Tens of thousands of characters never pass through the
+    agent — zero content tokens, no truncation or mutation risk; the
+    local file is the source of truth, the cache is the mirror.
+    get_translation_to_file completes the rework loop for yellow
+    (misaligned) chunks: export the translation, fix the block count
+    offline (editor or script), write it back. It also enables cache
+    migration when an engine / language / merge change creates a new
+    cache file, and human-review handoff.
+
 Safety boundaries
 -----------------
 * Only reads/writes existing cache files: never creates books, rows or
   tables, never touches WAL;
+* The *_to_file export tools write plain text files to caller-given
+  local paths: missing parent directories are auto-created (creating a
+  directory destroys nothing), but an existing file is only replaced
+  with overwrite=True;
 * Writes are short transactions (BEGIN IMMEDIATE + busy retry), safe to
   run alongside the plugin UI;
 * book_id only accepts file names that already exist inside the cache
@@ -479,7 +501,7 @@ def _progress_payload(scan: dict[str, Any]) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
-# Translation file ingestion + shared write path
+# File pipeline: text ingestion, text export, shared write path
 # --------------------------------------------------------------------------
 
 def _read_translation_file(file_path: str) -> tuple[str, Path]:
@@ -554,6 +576,81 @@ def _read_translation_file(file_path: str) -> tuple[str, Path]:
             f"File contains only whitespace: {path} (the translation "
             f"would be empty)")
     return text, path
+
+
+def _export_text_to_file(
+    text: str,
+    file_path: str,
+    overwrite: bool,
+) -> dict[str, Any]:
+    """Write `text` to a local file for the *_to_file export tools;
+    return a partial result dict (exported_file / characters, plus
+    verify_mismatch on mismatch) to be merged into the tool response.
+
+    Deliberate choices (mirroring _read_translation_file's philosophy):
+    * UTF-8 without BOM, LF line endings. newline="" is mandatory: with
+      the default newline=None, Python would translate "\n" to
+      os.linesep (\r\n on Windows) — the exported file would then
+      contradict the LF-based alignment conventions and differ from
+      what the database stores. newline="" writes the text verbatim.
+    * Missing parent directories are created automatically. Principle:
+      automate the non-destructive, guard the destructive — creating a
+      directory destroys nothing (a mistyped path merely lands one
+      extra file, and the exported_file echo makes it immediately
+      visible), whereas overwriting an existing file may destroy data
+      (e.g. a finished translation draft), so that stays behind the
+      explicit overwrite flag (default False).
+    * The file is read back after writing and compared with `text`: on
+      mismatch the response carries verify_mismatch: true (absent when
+      verified) — the same hard guarantee the write tools give, so a
+      caller never has to trust an export blindly.
+    * Relative paths resolve against THIS process's working directory
+      (same rule as the read side); the resolved absolute path is
+      echoed back as exported_file so the caller can catch mismatches.
+    """
+    if not isinstance(file_path, str) or not file_path.strip():
+        raise _ExpectedError(
+            "file_path must be a non-empty string (absolute path "
+            "recommended; relative paths resolve against the server "
+            "process's working directory, which may differ from the "
+            "caller's)")
+    if not isinstance(text, str) or not text.strip():
+        raise _ExpectedError("Nothing to export: the text is empty")
+    path = Path(file_path.strip()).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    if path.is_dir():
+        raise _ExpectedError(
+            f"Target path is a directory, not a file: {path}")
+    if path.exists() and not overwrite:
+        raise _ExpectedError(
+            f"File already exists: {path} (pass overwrite=True to "
+            f"replace it; refusing by default so a mistyped path can "
+            f"never silently destroy an existing file)")
+    try:
+        # auto-create missing parents: non-destructive convenience
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+    except OSError as e:
+        raise _ExpectedError(f"Cannot write file {path}: {e}")
+    result: dict[str, Any] = {
+        "exported_file": str(path),
+        "characters": len(text),
+    }
+    try:
+        readback = path.read_text(encoding="utf-8")
+    except OSError as e:
+        raise _ExpectedError(f"Cannot read back {path}: {e}")
+    if readback != text:
+        # Theoretically unreachable; kept as a hard guarantee for the
+        # caller: an absent verify_mismatch field means "verified".
+        result["verify_mismatch"] = True
+        result["verify_note"] = (
+            "Readback verification failed: the file on disk differs "
+            "from the exported text. Do not trust this export; inspect "
+            "the file and retry")
+    return result
 
 
 def _write_translation(
@@ -865,6 +962,66 @@ def get_original(
 
 
 @mcp.tool()
+def get_original_to_file(
+    book_id: str,
+    chunk_id: int,
+    file_path: str,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Export one chunk's original text to a local file and return only
+    metadata — the text itself never enters the conversation (zero
+    content tokens, no truncation risk on huge chunks). Mirrors
+    get_original (same metadata fields, same stripped text as the UI
+    proofreading panel shows) and is the symmetric counterpart of
+    write_chunk_from_file: originals flow cache -> file, translations
+    flow file -> cache, bulk text never passes through the agent.
+
+    Typical use: the first pass of a formal translation workflow —
+    export the original to a file, translate against the file, write
+    the result back with write_chunk_from_file. For ad-hoc inspection
+    prefer get_original directly.
+
+    File handling: UTF-8 without BOM, LF line endings. Missing parent
+    directories are created automatically (creating a directory
+    destroys nothing; the resolved path is echoed as exported_file).
+    An existing file is NOT overwritten unless overwrite=True — a
+    mistyped path must never silently destroy an existing file (e.g. a
+    finished translation draft). After writing, the file is read back
+    and verified; verify_mismatch appears only if it differs. Relative
+    paths resolve against the server process's working directory,
+    which may differ from the caller's — absolute paths are strongly
+    recommended. chunk_id is this book's database cache id (see
+    list_chunks); the response echoes book_id and title — verify it is
+    the intended book."""
+    conn = _connect(_book_path(book_id))
+    try:
+        scan = _scan_chunks(conn)
+        chunk = _chunk_by_id(scan, chunk_id)
+        text = (chunk["original"] or "").strip()
+        if not text:
+            raise _ExpectedError(
+                f"chunk {chunk_id} has no original text to export")
+        result: dict[str, Any] = {
+            "book_id": book_id,
+            "chunk_id": chunk["chunk_id"],
+            "ui_row": chunk["ui_row"],
+            "title": scan["info"].get("title"),
+            "status": "translated" if chunk["translated"]
+                      else "untranslated",
+            "merge_enabled": scan["merge_enabled"],
+        }
+        if scan["merge_enabled"]:
+            result["blocks"] = _block_count(chunk["original"])
+        # merge the export result (exported_file / characters /
+        # verify_mismatch on mismatch); the response never contains
+        # the original text itself
+        result.update(_export_text_to_file(text, file_path, overwrite))
+        return result
+    finally:
+        conn.close()
+
+
+@mcp.tool()
 def get_translation(book_id: str, chunk_id: int) -> dict[str, Any]:
     """Read the full translation and alignment state of one chunk —
     identical to what the UI's proofreading panel shows. chunk_id is
@@ -902,6 +1059,78 @@ def get_translation(book_id: str, chunk_id: int) -> dict[str, Any]:
             result["target_lang"] = extra[1]
         if scan["merge_enabled"] and chunk["translated"]:
             result["yellow_warning"] = not alignment["aligned"]
+        return result
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def get_translation_to_file(
+    book_id: str,
+    chunk_id: int,
+    file_path: str,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Export one chunk's current translation to a local file and
+    return only metadata — the text itself never enters the
+    conversation. Mirrors get_translation (same metadata and alignment
+    fields, same stripped text as the UI proofreading panel shows).
+
+    Typical uses:
+    * Rework a yellow (misaligned) chunk without any bulk text through
+      the agent: export the translation, fix the block count offline
+      (editor or script — deterministic, zero tokens), write it back
+      with write_chunk_from_file.
+    * Migrate translations after changing engine / target language /
+      merge settings (the plugin then creates a new cache file):
+      export every chunk from the old cache, write them into the new
+      one.
+    * Hand the current draft to a human reviewer, or archive a book's
+      translations as plain text.
+
+    The chunk must already have a translation (status translated);
+    exporting an untranslated chunk is an error. File handling is the
+    same as get_original_to_file: UTF-8 without BOM, LF; missing
+    parent directories are created automatically; an existing file is
+    not overwritten unless overwrite=True; the file is read back and
+    verified (verify_mismatch appears only on mismatch). Relative
+    paths resolve against the server process's working directory —
+    absolute paths recommended. chunk_id is this book's database cache
+    id (see list_chunks); the response echoes book_id and title —
+    verify it is the intended book."""
+    conn = _connect(_book_path(book_id))
+    try:
+        scan = _scan_chunks(conn)
+        chunk = _chunk_by_id(scan, chunk_id)
+        if not chunk["translated"]:
+            raise _ExpectedError(
+                f"chunk {chunk_id} has no translation to export (its "
+                f"status is untranslated; write one first via "
+                f"write_chunk or write_chunk_from_file)")
+        text = (chunk["translation"] or "").strip()
+        alignment = _alignment(
+            chunk["original"], chunk["translation"], scan["merge_enabled"])
+        result: dict[str, Any] = {
+            "book_id": book_id,
+            "chunk_id": chunk["chunk_id"],
+            "ui_row": chunk["ui_row"],
+            "title": scan["info"].get("title"),
+            "status": "translated",
+            "merge_enabled": scan["merge_enabled"],
+            "alignment": alignment,
+        }
+        extra = conn.execute(
+            "SELECT engine_name, target_lang FROM cache"
+            " WHERE rowid = ?", (chunk["rowid"],)).fetchone()
+        if extra:
+            result["engine_name"] = extra[0]
+            result["target_lang"] = extra[1]
+        if scan["merge_enabled"]:
+            result["yellow_warning"] = not alignment["aligned"]
+        # merge the export result (exported_file / characters /
+        # verify_mismatch on mismatch); the response never contains
+        # the translation text itself
+        result.update(_export_text_to_file(text, file_path, overwrite))
         return result
     finally:
         conn.close()
